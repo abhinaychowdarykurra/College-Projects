@@ -1,0 +1,2097 @@
+Heading
+=======
+Project Heading: Fake image recogniton system
+
+
+Structure
+=========
+Project Structure (tree format):
+
+.
+|-- pyrightconfig.json
+|-- deep-learning-fake-image-detection/
+|   |-- metadata.json
+|   |-- README.md
+|   |-- app/
+|   |   |-- app.py
+|   |   |-- build_stratified_splits.py
+|   |   |-- eval_valid.py
+|   |   |-- run_strict_pipeline.py
+|   |   |-- train.py
+|   |   |-- tune_threshold.py
+|   |   |-- logs/
+|   |   |-- models/
+|   |   |   |-- best_model.keras
+|   |   |   |-- last_train_run.json
+|   |   |-- optional_tools/
+|   |   |   |-- mine_hard_examples.py
+|   |   |   |-- sanity_check.py
+|   |   |   |-- simple_eval.py
+|   |   |-- static/
+|   |   |   |-- archive/
+|   |   |   |-- uploads/
+|   |   |-- templates/
+|   |   |   |-- index.html
+|-- dataset/
+|   |-- fake/
+|   |-- real/
+|   |-- smoke_split/
+|   |   |-- test/
+|   |   |   |-- fake/
+|   |   |   |-- real/
+|   |   |-- train/
+|   |   |   |-- fake/
+|   |   |   |-- real/
+|   |   |-- valid/
+|   |   |   |-- fake/
+|   |   |   |-- real/
+|   |-- strict_split/
+|   |   |-- manifests/
+|   |   |   |-- metadata.json
+|   |   |   |-- test.csv
+|   |   |   |-- train.csv
+|   |   |   |-- valid.csv
+|   |   |-- test/
+|   |   |   |-- fake/
+|   |   |   |-- real/
+|   |   |-- train/
+|   |   |   |-- fake/
+|   |   |   |-- real/
+|   |   |-- valid/
+|   |   |   |-- fake/
+|   |   |   |-- real/
+|   |-- train/
+|   |   |-- fake/
+|   |   |-- real/
+|   |-- valid/
+|   |   |-- fake/
+|   |   |-- real/
+|-- models/
+|   |-- archive/
+|   |   |-- fake_image_detector.keras
+|-- notebooks/
+|-- rvf10k/
+|   |-- train/
+|   |   |-- fake/
+|   |   |-- real/
+|   |-- valid/
+|   |   |-- fake/
+|   |   |-- real/
+
+
+Code Files
+==========
+
+File: app/app.py
+----------------
+from flask import Flask, render_template, request
+import tensorflow as tf
+import numpy as np
+from keras.utils import load_img, img_to_array
+from keras.applications.efficientnet import preprocess_input
+from werkzeug.utils import secure_filename
+import os
+import time
+
+app = Flask(__name__)
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Load trained model.
+# 1) Prefer new model saved by train.py at app/models/best_model.keras
+# 2) Fallback to legacy models in ../models/ if present.
+MODEL_PRIMARY = os.path.join(APP_DIR, "models", "best_model.keras")
+MODEL_PATH_KERAS = os.path.join(APP_DIR, "..", "models", "fake_image_detector.keras")
+MODEL_PATH_H5 = os.path.join(APP_DIR, "..", "models", "fake_image_detector_transfer.h5")
+
+model = None
+try:
+    if os.path.exists(MODEL_PRIMARY):
+        model = tf.keras.models.load_model(MODEL_PRIMARY)
+    elif os.path.exists(MODEL_PATH_KERAS):
+        model = tf.keras.models.load_model(MODEL_PATH_KERAS)
+    elif os.path.exists(MODEL_PATH_H5):
+        model = tf.keras.models.load_model(MODEL_PATH_H5)
+    else:
+        print(
+            "Warning: No model file found. Place 'best_model.keras' in app/models "
+            "or keep a compatible model in '../models'. Predictions will be disabled."
+        )
+except Exception as e:
+    print(f"Warning: Failed to load model: {e}")
+    model = None
+
+UPLOAD_FOLDER = os.path.join(APP_DIR, "static", "uploads")
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+
+# Derive the expected input size from the loaded model to avoid
+# mismatches between training and inference (e.g. 224 vs 300).
+if model is not None and hasattr(model, "input_shape") and len(model.input_shape) == 4:
+    TARGET_SIZE = (model.input_shape[1], model.input_shape[2])
+else:
+    TARGET_SIZE = (224, 224)
+print("Using input size for prediction:", TARGET_SIZE)
+
+# Tuned decision threshold for classifying an image as REAL.
+# Obtained from tune_threshold.py using validation F1-score.
+THRESHOLD = 0.47
+REAL_IF_HIGH_PROB = True
+UNCERTAINTY_MARGIN = 0.08
+TTA_STD_MAX = 0.12
+ENABLE_RUNTIME_CALIBRATION = False
+
+
+def calibrate_with_validation_data():
+    """Calibrate threshold and label direction from validation data if available."""
+    global THRESHOLD, REAL_IF_HIGH_PROB
+    if model is None:
+        return
+
+    valid_dir = os.path.join(APP_DIR, "..", "dataset", "strict_split", "valid")
+    if not os.path.isdir(valid_dir):
+        valid_dir = os.path.join(APP_DIR, "..", "dataset", "valid")
+    if not os.path.isdir(valid_dir):
+        print("Validation folder not found; using default threshold:", THRESHOLD)
+        return
+
+    try:
+        raw_val_data = tf.keras.utils.image_dataset_from_directory(
+            valid_dir,
+            labels="inferred",
+            label_mode="int",
+            image_size=TARGET_SIZE,
+            batch_size=32,
+            shuffle=False,
+        )
+
+        val_data = raw_val_data.map(
+            lambda x, y: (preprocess_input(tf.cast(x, tf.float32)), tf.cast(y, tf.float32)),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        ).prefetch(tf.data.AUTOTUNE)
+
+        probs = model.predict(val_data, verbose=0).ravel()
+        y_true = np.concatenate([y.numpy() for _, y in raw_val_data], axis=0).astype(int)
+
+        thresholds = np.arange(0.1, 0.91, 0.01)
+        best_acc = -1.0
+        best_t = THRESHOLD
+        best_real_if_high = True
+
+        for t in thresholds:
+            pred_normal = (probs > t).astype(int)
+            acc_normal = float((pred_normal == y_true).mean())
+
+            pred_inverted = 1 - pred_normal
+            acc_inverted = float((pred_inverted == y_true).mean())
+
+            if acc_normal > best_acc:
+                best_acc = acc_normal
+                best_t = float(t)
+                best_real_if_high = True
+
+            if acc_inverted > best_acc:
+                best_acc = acc_inverted
+                best_t = float(t)
+                best_real_if_high = False
+
+        THRESHOLD = best_t
+        REAL_IF_HIGH_PROB = best_real_if_high
+        print(
+            "Calibration complete. threshold=",
+            round(THRESHOLD, 3),
+            "real_if_high_prob=",
+            REAL_IF_HIGH_PROB,
+            "val_acc=",
+            round(best_acc * 100.0, 2),
+            "%",
+        )
+    except Exception as e:
+        print(f"Calibration skipped due to error: {e}")
+
+
+if ENABLE_RUNTIME_CALIBRATION:
+    calibrate_with_validation_data()
+else:
+    print("Runtime threshold calibration disabled. Using fixed threshold:", THRESHOLD)
+
+
+def predict_image(img_path):
+    """Return predicted label, confidence, and diagnostics for UI display."""
+    if model is None:
+        raise RuntimeError(
+            "Model is not loaded. Place the model file in the 'models' folder."
+        )
+
+    img = load_img(img_path, target_size=TARGET_SIZE)
+    base = img_to_array(img)
+
+    # Keep inference consistent with eval_valid.py and tune_threshold.py: single-view prediction.
+    batch = np.expand_dims(base, axis=0).astype(np.float32)
+    batch = preprocess_input(batch)
+
+    decision_prob = float(model.predict(batch, verbose=0).ravel()[0])
+    prob_mean = decision_prob
+    prob_median = decision_prob
+    prob_std = 0.0
+    print("Prediction prob:", decision_prob)
+    predicts_real = decision_prob > THRESHOLD if REAL_IF_HIGH_PROB else decision_prob <= THRESHOLD
+
+    prob_real = decision_prob if REAL_IF_HIGH_PROB else (1.0 - decision_prob)
+    prob_fake = 1.0 - prob_real
+
+    if predicts_real:
+        label = "Real"
+        confidence = prob_real * 100.0
+    else:
+        label = "Fake"
+        confidence = prob_fake * 100.0
+
+    note = f"Model prob: {decision_prob:.3f}"
+    return label, round(confidence, 2), note
+
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    prediction = None
+    confidence = None
+    prediction_note = None
+    uploaded_image = None
+    error = None
+    if request.method == "POST":
+        file = request.files.get("file")
+        if file and file.filename:
+            safe_name = secure_filename(file.filename)
+            stamped_name = f"{int(time.time())}_{safe_name}"
+            filepath = os.path.join(app.config["UPLOAD_FOLDER"], stamped_name)
+            file.save(filepath)
+            static_relpath = os.path.join("uploads", stamped_name).replace("\\", "/")
+            if model is None:
+                error = (
+                    "Model is not loaded. Upload is saved, "
+                    "but prediction cannot be made."
+                )
+                uploaded_image = static_relpath
+            else:
+                prediction, confidence, prediction_note = predict_image(filepath)
+                uploaded_image = static_relpath
+            return render_template(
+                "index.html",
+                prediction=prediction,
+                confidence=confidence,
+                prediction_note=prediction_note,
+                image=uploaded_image,
+                error=error,
+            )
+
+    return render_template(
+        "index.html",
+        prediction=prediction,
+        confidence=confidence,
+        prediction_note=prediction_note,
+        error=error,
+    )
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
+
+
+File: app/build_stratified_splits.py
+------------------------------------
+import argparse
+import csv
+import hashlib
+import json
+import os
+import random
+import shutil
+from datetime import datetime
+
+SUPPORTED_EXTS = (".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp", ".tif", ".tiff")
+CLASS_NAMES = ("fake", "real")
+
+
+def parse_args():
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(app_dir)
+    dataset_root = os.path.join(project_root, "dataset")
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Build deterministic stratified train/valid/test folders with manifests. "
+            "Default source is existing dataset splits."
+        )
+    )
+    parser.add_argument(
+        "--dataset-root",
+        default=dataset_root,
+        help="Dataset root containing source folders.",
+    )
+    parser.add_argument(
+        "--source-mode",
+        choices=["existing-splits", "raw-classes"],
+        default="existing-splits",
+        help=(
+            "existing-splits: source from dataset/train|valid|test/{fake,real}; "
+            "raw-classes: source from dataset/{fake,real}."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Output split root. Default: <dataset-root>/strict_split",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducible split.")
+    parser.add_argument("--valid-ratio", type=float, default=0.15, help="Validation ratio in [0,1).")
+    parser.add_argument("--test-ratio", type=float, default=0.10, help="Test ratio in [0,1).")
+    parser.add_argument(
+        "--valid-count-per-class",
+        type=int,
+        default=None,
+        help="If set, use this exact validation count per class (overrides --valid-ratio).",
+    )
+    parser.add_argument(
+        "--test-count-per-class",
+        type=int,
+        default=None,
+        help="If set, use this exact test count per class (overrides --test-ratio).",
+    )
+    parser.add_argument(
+        "--link-mode",
+        choices=["hardlink", "copy"],
+        default="hardlink",
+        help="How to materialize files into split folders.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Delete output directory first if it already exists.",
+    )
+    return parser.parse_args()
+
+
+def collect_sources(dataset_root, source_mode):
+    sources = {"fake": [], "real": []}
+
+    if source_mode == "raw-classes":
+        for cls in CLASS_NAMES:
+            class_dir = os.path.join(dataset_root, cls)
+            if not os.path.isdir(class_dir):
+                raise FileNotFoundError(f"Expected source class folder: {class_dir}")
+            sources[cls].append(class_dir)
+    else:
+        found_any = False
+        for split in ("train", "valid", "test"):
+            split_dir = os.path.join(dataset_root, split)
+            if not os.path.isdir(split_dir):
+                continue
+            for cls in CLASS_NAMES:
+                class_dir = os.path.join(split_dir, cls)
+                if os.path.isdir(class_dir):
+                    found_any = True
+                    sources[cls].append(class_dir)
+        if not found_any:
+            raise FileNotFoundError(
+                "No existing split source directories found under dataset/{train,valid,test}/{fake,real}."
+            )
+
+    return sources
+
+
+def collect_images(class_dirs):
+    paths = []
+    for class_dir in class_dirs:
+        for root, _, files in os.walk(class_dir):
+            for name in files:
+                ext = os.path.splitext(name)[1].lower()
+                if ext in SUPPORTED_EXTS:
+                    paths.append(os.path.abspath(os.path.join(root, name)))
+
+    deduped = sorted(set(paths))
+    return deduped
+
+
+def stratified_split(
+    paths_by_class,
+    valid_ratio,
+    test_ratio,
+    seed,
+    valid_count_per_class=None,
+    test_count_per_class=None,
+):
+    if valid_ratio < 0 or test_ratio < 0 or (valid_ratio + test_ratio) >= 1.0:
+        raise ValueError("valid_ratio and test_ratio must be >=0 and sum to < 1.0")
+    if valid_count_per_class is not None and valid_count_per_class < 0:
+        raise ValueError("valid_count_per_class must be >= 0")
+    if test_count_per_class is not None and test_count_per_class < 0:
+        raise ValueError("test_count_per_class must be >= 0")
+
+    rng = random.Random(seed)
+    split_map = {"train": {"fake": [], "real": []}, "valid": {"fake": [], "real": []}, "test": {"fake": [], "real": []}}
+
+    for cls, paths in paths_by_class.items():
+        local = list(paths)
+        rng.shuffle(local)
+        n = len(local)
+
+        if test_count_per_class is None:
+            n_test = int(round(n * test_ratio))
+        else:
+            n_test = int(test_count_per_class)
+
+        if valid_count_per_class is None:
+            n_valid = int(round(n * valid_ratio))
+        else:
+            n_valid = int(valid_count_per_class)
+
+        if n_test + n_valid >= n:
+            raise RuntimeError(
+                f"Requested split sizes exceed available samples for class '{cls}': "
+                f"n={n}, valid={n_valid}, test={n_test}."
+            )
+
+        n_train = n - n_valid - n_test
+
+        if n_train <= 0:
+            raise RuntimeError(
+                f"Not enough samples for class '{cls}' with ratios valid={valid_ratio}, test={test_ratio}."
+            )
+
+        split_map["test"][cls] = local[:n_test]
+        split_map["valid"][cls] = local[n_test:n_test + n_valid]
+        split_map["train"][cls] = local[n_test + n_valid:]
+
+    return split_map
+
+
+def ensure_clean_dir(path, overwrite):
+    if os.path.exists(path):
+        if not overwrite:
+            raise FileExistsError(
+                f"Output directory already exists: {path}. Use --overwrite to replace it."
+            )
+        shutil.rmtree(path)
+    os.makedirs(path, exist_ok=True)
+
+
+def safe_name(src_path, index):
+    base = os.path.basename(src_path)
+    stem, ext = os.path.splitext(base)
+    digest = hashlib.sha1(src_path.encode("utf-8")).hexdigest()[:10]
+    return f"{index:06d}_{stem}_{digest}{ext.lower()}"
+
+
+def materialize(split_map, output_root, link_mode):
+    manifests_dir = os.path.join(output_root, "manifests")
+    os.makedirs(manifests_dir, exist_ok=True)
+
+    summary = {"train": {}, "valid": {}, "test": {}}
+
+    for split in ("train", "valid", "test"):
+        rows = []
+        for cls in CLASS_NAMES:
+            dst_class_dir = os.path.join(output_root, split, cls)
+            os.makedirs(dst_class_dir, exist_ok=True)
+
+            class_paths = split_map[split][cls]
+            for idx, src in enumerate(class_paths, start=1):
+                dst_name = safe_name(src, idx)
+                dst = os.path.join(dst_class_dir, dst_name)
+                if link_mode == "hardlink":
+                    try:
+                        os.link(src, dst)
+                    except OSError:
+                        shutil.copy2(src, dst)
+                else:
+                    shutil.copy2(src, dst)
+
+                rows.append(
+                    {
+                        "split": split,
+                        "label": 0 if cls == "fake" else 1,
+                        "label_str": cls,
+                        "src_path": src,
+                        "dst_path": dst,
+                    }
+                )
+
+            summary[split][cls] = len(class_paths)
+
+        manifest_path = os.path.join(manifests_dir, f"{split}.csv")
+        with open(manifest_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["split", "label", "label_str", "src_path", "dst_path"],
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+
+    return summary
+
+
+def main():
+    args = parse_args()
+    dataset_root = os.path.abspath(args.dataset_root)
+    output_root = os.path.abspath(args.output_dir or os.path.join(dataset_root, "strict_split"))
+
+    sources = collect_sources(dataset_root, args.source_mode)
+    paths_by_class = {
+        cls: collect_images(sources[cls])
+        for cls in CLASS_NAMES
+    }
+
+    for cls in CLASS_NAMES:
+        if len(paths_by_class[cls]) == 0:
+            raise RuntimeError(f"No usable images found for class '{cls}'.")
+
+    split_map = stratified_split(
+        paths_by_class=paths_by_class,
+        valid_ratio=float(args.valid_ratio),
+        test_ratio=float(args.test_ratio),
+        seed=int(args.seed),
+        valid_count_per_class=args.valid_count_per_class,
+        test_count_per_class=args.test_count_per_class,
+    )
+
+    ensure_clean_dir(output_root, overwrite=bool(args.overwrite))
+    summary = materialize(split_map, output_root=output_root, link_mode=args.link_mode)
+
+    metadata = {
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "dataset_root": dataset_root,
+        "output_root": output_root,
+        "source_mode": args.source_mode,
+        "seed": int(args.seed),
+        "valid_ratio": float(args.valid_ratio),
+        "test_ratio": float(args.test_ratio),
+        "valid_count_per_class": args.valid_count_per_class,
+        "test_count_per_class": args.test_count_per_class,
+        "link_mode": args.link_mode,
+        "source_counts": {cls: len(paths_by_class[cls]) for cls in CLASS_NAMES},
+        "split_counts": summary,
+    }
+
+    metadata_path = os.path.join(output_root, "manifests", "metadata.json")
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+    print("Created strict stratified split at:", output_root)
+    print("Source counts:", metadata["source_counts"])
+    print("Split counts:", summary)
+    print("Metadata:", metadata_path)
+
+
+if __name__ == "__main__":
+    main()
+
+
+File: app/eval_valid.py
+-----------------------
+import os
+import argparse
+import time
+import numpy as np
+import tensorflow as tf
+from keras.applications.efficientnet import preprocess_input
+
+# Match paths and settings from train.py
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(APP_DIR)
+DATASET_ROOT = os.path.join(PROJECT_ROOT, "dataset")
+TRAIN_DIR = os.path.join(DATASET_ROOT, "train")
+VALID_DIR = os.path.join(DATASET_ROOT, "valid")
+TEST_DIR = os.path.join(DATASET_ROOT, "test")
+
+MODEL_PATH = os.path.join(APP_DIR, "models", "best_model.keras")
+
+# Use the same tuned threshold as the web app (see app.py / tune_threshold.py)
+THRESHOLD = 0.45
+SUPPORTED_EXTS = (".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp", ".tif", ".tiff")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Evaluate trained model on a real/fake dataset directory. "
+            "Can evaluate train, valid, test, all, or a custom --data-dir."
+        )
+    )
+    parser.add_argument(
+        "--dataset-root",
+        default=DATASET_ROOT,
+        help="Dataset root containing train/valid/test subfolders.",
+    )
+    parser.add_argument(
+        "--data-dir",
+        default=None,
+        help="Path to dataset folder containing 'fake' and 'real' subfolders.",
+    )
+    parser.add_argument(
+        "--split",
+        choices=["train", "valid", "test", "all"],
+        default="valid",
+        help="Dataset split under dataset/ to evaluate when --data-dir is not provided.",
+    )
+    parser.add_argument(
+        "--model-path",
+        default=MODEL_PATH,
+        help="Path to trained .keras model file.",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=THRESHOLD,
+        help="Classification threshold for converting probabilities to labels.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Batch size for evaluation.",
+    )
+    parser.add_argument(
+        "--allow-mismatch",
+        action="store_true",
+        help=(
+            "Continue evaluation even when some files are unreadable. "
+            "By default, unreadable files raise an error."
+        ),
+    )
+    parser.add_argument(
+        "--bad-files-report",
+        default=os.path.join(APP_DIR, "bad_images_report.txt"),
+        help="Path to write unreadable image file paths.",
+    )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=250,
+        help="Print progress every N processed images.",
+    )
+    return parser.parse_args()
+
+
+def collect_candidate_files(class_dir):
+    paths = []
+    unsupported = []
+    for root, _, files in os.walk(class_dir):
+        for name in files:
+            ext = os.path.splitext(name)[1].lower()
+            if ext in SUPPORTED_EXTS:
+                paths.append(os.path.join(root, name))
+            else:
+                unsupported.append(os.path.join(root, name))
+    paths.sort()
+    unsupported.sort()
+    return paths, unsupported
+
+
+def evaluate_directory(
+    model,
+    eval_dir,
+    split_name,
+    img_size,
+    threshold,
+    batch_size,
+    allow_mismatch,
+    bad_files_report,
+    progress_every,
+):
+    fake_dir = os.path.join(eval_dir, "fake")
+    real_dir = os.path.join(eval_dir, "real")
+    if not (os.path.isdir(fake_dir) and os.path.isdir(real_dir)):
+        raise FileNotFoundError(
+            f"Expected '{eval_dir}' to contain 'fake' and 'real' subfolders."
+        )
+
+    fake_candidates, fake_unsupported = collect_candidate_files(fake_dir)
+    real_candidates, real_unsupported = collect_candidate_files(real_dir)
+    candidate_count = len(fake_candidates) + len(real_candidates)
+    unsupported_total = len(fake_unsupported) + len(real_unsupported)
+
+    print(f"\n=== Evaluating split: {split_name} ===")
+    print("Dataset path:", eval_dir)
+    print("File counts (candidate image extensions) -> fake:", len(fake_candidates), "real:", len(real_candidates))
+    if unsupported_total > 0:
+        print(
+            "Warning: Found",
+            unsupported_total,
+            "unsupported files in class folders (ignored by TensorFlow).",
+        )
+
+    all_paths = fake_candidates + real_candidates
+    all_labels = [0] * len(fake_candidates) + [1] * len(real_candidates)
+    total_files = len(all_paths)
+
+    good_true = []
+    good_probs = []
+    bad_paths = []
+
+    batch_imgs = []
+    batch_labels = []
+    start_time = time.perf_counter()
+    processed_files = 0
+
+    def _fmt_duration(seconds):
+        seconds = max(0, int(seconds))
+        hrs = seconds // 3600
+        mins = (seconds % 3600) // 60
+        secs = seconds % 60
+        if hrs > 0:
+            return f"{hrs:02d}:{mins:02d}:{secs:02d}"
+        return f"{mins:02d}:{secs:02d}"
+
+    def _print_progress(force=False):
+        if total_files == 0:
+            return
+        if (not force) and (processed_files % progress_every != 0):
+            return
+        elapsed = time.perf_counter() - start_time
+        rate = processed_files / elapsed if elapsed > 0 else 0.0
+        remaining = total_files - processed_files
+        eta = (remaining / rate) if rate > 0 else 0.0
+        pct = (processed_files / total_files) * 100.0
+        print(
+            f"Progress [{split_name}]: {processed_files}/{total_files} "
+            f"({pct:.1f}%) | loaded={len(good_true)} bad={len(bad_paths)} "
+            f"| {rate:.2f} img/s | elapsed={_fmt_duration(elapsed)} "
+            f"ETA={_fmt_duration(eta)}"
+        )
+
+    def flush_batch():
+        if not batch_imgs:
+            return
+        x = np.stack(batch_imgs, axis=0).astype(np.float32)
+        x = preprocess_input(x)
+        probs_batch = model.predict(x, verbose=0).ravel()
+        good_probs.extend(probs_batch.tolist())
+        good_true.extend(batch_labels)
+        batch_imgs.clear()
+        batch_labels.clear()
+
+    for path, label in zip(all_paths, all_labels):
+        try:
+            img = tf.keras.utils.load_img(path, target_size=img_size)
+            arr = tf.keras.utils.img_to_array(img)
+            batch_imgs.append(arr)
+            batch_labels.append(label)
+            if len(batch_imgs) >= batch_size:
+                flush_batch()
+        except Exception:
+            bad_paths.append(path)
+        finally:
+            processed_files += 1
+            _print_progress(force=(processed_files == total_files))
+
+    flush_batch()
+    _print_progress(force=True)
+
+    if bad_paths:
+        os.makedirs(os.path.dirname(bad_files_report), exist_ok=True)
+        with open(bad_files_report, "a", encoding="utf-8") as f:
+            f.write(f"\n[{split_name}] unreadable images in {eval_dir}\n")
+            for p in bad_paths:
+                f.write(p + "\n")
+
+    loaded_count = len(good_true)
+    print("Decodable images loaded:", loaded_count)
+    if bad_paths:
+        print(
+            "Warning: Found",
+            len(bad_paths),
+            "unreadable image files. Paths appended to:",
+            bad_files_report,
+        )
+
+    if loaded_count != candidate_count:
+        msg = (
+            f"Decodable image count mismatch for '{split_name}'. "
+            f"Candidate image files: {candidate_count}, decodable: {loaded_count}."
+        )
+        if allow_mismatch:
+            print("Warning:", msg)
+        else:
+            raise RuntimeError(msg)
+
+    if loaded_count == 0:
+        raise RuntimeError(f"No decodable images found in '{eval_dir}'.")
+
+    true = np.array(good_true, dtype=np.int32)
+    probs = np.array(good_probs, dtype=np.float32)
+    preds = (probs > threshold).astype(np.int32)
+
+    bce = tf.keras.losses.binary_crossentropy(
+        tf.convert_to_tensor(true, dtype=tf.float32),
+        tf.convert_to_tensor(probs, dtype=tf.float32),
+    )
+    loss = float(tf.reduce_mean(bce).numpy())
+    acc = float((preds == true).mean())
+
+    print("Loss:", loss)
+    print("Accuracy:", acc * 100.0, "%")
+
+    cm = np.zeros((2, 2), dtype=int)
+    for t, p in zip(true, preds):
+        row = 0 if int(t) == 0 else 1
+        col = 0 if int(p) == 0 else 1
+        cm[row, col] += 1
+
+    tn, fp, fn, tp = cm[0, 0], cm[0, 1], cm[1, 0], cm[1, 1]
+    print("\nConfusion Matrix (counts):")
+    print("            Pred Fake   Pred Real")
+    print(f"True Fake   {tn:9d} {fp:10d}")
+    print(f"True Real   {fn:9d} {tp:10d}")
+
+    acc_manual = (preds == true).mean() * 100.0
+    print("Manual accuracy check:", acc_manual, "%")
+
+    return {
+        "split": split_name,
+        "loss": float(loss),
+        "accuracy": float(acc),
+        "loaded_count": loaded_count,
+        "expected_supported": candidate_count,
+        "bad_count": len(bad_paths),
+    }
+
+
+args = parse_args()
+model_path = os.path.abspath(args.model_path)
+dataset_root = os.path.abspath(args.dataset_root)
+train_dir = os.path.join(dataset_root, "train")
+valid_dir = os.path.join(dataset_root, "valid")
+test_dir = os.path.join(dataset_root, "test")
+threshold = float(args.threshold)
+batch_size = int(args.batch_size)
+allow_mismatch = bool(args.allow_mismatch)
+bad_files_report = os.path.abspath(args.bad_files_report)
+progress_every = max(1, int(args.progress_every))
+
+if not os.path.exists(model_path):
+    raise FileNotFoundError(
+        f"Could not find trained model at '{model_path}'. Run train.py first."
+    )
+
+if args.data_dir:
+    eval_targets = [("custom", os.path.abspath(args.data_dir))]
+else:
+    if args.split == "train":
+        eval_targets = [("train", train_dir)]
+    elif args.split == "valid":
+        eval_targets = [("valid", valid_dir)]
+    elif args.split == "test":
+        eval_targets = [("test", test_dir)]
+    else:
+        eval_targets = [("train", train_dir), ("valid", valid_dir), ("test", test_dir)]
+
+for split_name, split_dir in eval_targets:
+    if not os.path.isdir(split_dir):
+        raise FileNotFoundError(f"Expected dataset split folder at '{split_dir}'.")
+
+print("Loading model from:", model_path)
+print("Using threshold:", threshold)
+print("Using batch size:", batch_size)
+print("Dataset root:", dataset_root)
+print("Progress update every:", progress_every, "images")
+print("Bad files report path:", bad_files_report)
+model = tf.keras.models.load_model(model_path)
+
+# Derive expected input size from model
+if hasattr(model, "input_shape") and len(model.input_shape) == 4:
+    img_size = (model.input_shape[1], model.input_shape[2])
+else:
+    img_size = (300, 300)
+
+print("Using validation image size:", img_size)
+
+results = []
+for split_name, split_dir in eval_targets:
+    metrics = evaluate_directory(
+        model=model,
+        eval_dir=split_dir,
+        split_name=split_name,
+        img_size=img_size,
+        threshold=threshold,
+        batch_size=batch_size,
+        allow_mismatch=allow_mismatch,
+        bad_files_report=bad_files_report,
+        progress_every=progress_every,
+    )
+    results.append(metrics)
+
+if len(results) > 1:
+    print("\n=== Summary ===")
+    for item in results:
+        print(
+            f"{item['split']}: accuracy={item['accuracy'] * 100.0:.2f}% "
+            f"loss={item['loss']:.4f} "
+            f"loaded={item['loaded_count']} "
+            f"expected_supported={item['expected_supported']}"
+        )
+
+
+File: app/run_strict_pipeline.py
+--------------------------------
+import argparse
+import os
+import subprocess
+import sys
+
+
+def run_step(cmd, cwd):
+    print("\n>>>", " ".join(cmd))
+    result = subprocess.run(cmd, cwd=cwd)
+    if result.returncode != 0:
+        raise RuntimeError(f"Step failed with exit code {result.returncode}: {' '.join(cmd)}")
+
+
+def parse_args():
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(app_dir)
+    dataset_root = os.path.join(project_root, "dataset")
+
+    parser = argparse.ArgumentParser(
+        description="Run strict reproducible split -> train -> tune -> eval pipeline."
+    )
+    parser.add_argument("--dataset-root", default=dataset_root)
+    parser.add_argument("--strict-split-dir", default=None)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--valid-ratio", type=float, default=0.15)
+    parser.add_argument("--test-ratio", type=float, default=0.10)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--img-size", type=int, default=300)
+    parser.add_argument("--epochs-phase1", type=int, default=10)
+    parser.add_argument("--epochs-phase2", type=int, default=6)
+    parser.add_argument(
+        "--source-mode",
+        choices=["existing-splits", "raw-classes"],
+        default="existing-splits",
+    )
+    parser.add_argument(
+        "--link-mode",
+        choices=["hardlink", "copy"],
+        default="hardlink",
+    )
+    parser.add_argument("--overwrite-split", action="store_true")
+    parser.add_argument("--model-path", default=os.path.join(app_dir, "models", "best_model.keras"))
+    parser.add_argument("--skip-split", action="store_true")
+    parser.add_argument("--skip-train", action="store_true")
+    parser.add_argument("--skip-tune", action="store_true")
+    parser.add_argument("--skip-test-eval", action="store_true")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    strict_split_dir = os.path.abspath(
+        args.strict_split_dir or os.path.join(args.dataset_root, "strict_split")
+    )
+
+    py = sys.executable
+
+    if not args.skip_split:
+        split_cmd = [
+            py,
+            os.path.join(app_dir, "build_stratified_splits.py"),
+            "--dataset-root",
+            os.path.abspath(args.dataset_root),
+            "--source-mode",
+            args.source_mode,
+            "--output-dir",
+            strict_split_dir,
+            "--seed",
+            str(args.seed),
+            "--valid-ratio",
+            str(args.valid_ratio),
+            "--test-ratio",
+            str(args.test_ratio),
+            "--link-mode",
+            args.link_mode,
+        ]
+        if args.overwrite_split:
+            split_cmd.append("--overwrite")
+        run_step(split_cmd, cwd=app_dir)
+
+    if not args.skip_train:
+        train_cmd = [
+            py,
+            os.path.join(app_dir, "train.py"),
+            "--dataset-root",
+            strict_split_dir,
+            "--model-path",
+            os.path.abspath(args.model_path),
+            "--seed",
+            str(args.seed),
+            "--img-size",
+            str(args.img_size),
+            "--batch-size",
+            str(args.batch_size),
+            "--epochs-phase1",
+            str(args.epochs_phase1),
+            "--epochs-phase2",
+            str(args.epochs_phase2),
+        ]
+        run_step(train_cmd, cwd=app_dir)
+
+    if not args.skip_tune:
+        tune_cmd = [
+            py,
+            os.path.join(app_dir, "tune_threshold.py"),
+            "--dataset-root",
+            strict_split_dir,
+            "--model-path",
+            os.path.abspath(args.model_path),
+            "--batch-size",
+            str(max(16, args.batch_size)),
+        ]
+        run_step(tune_cmd, cwd=app_dir)
+
+    if not args.skip_test_eval:
+        eval_cmd = [
+            py,
+            os.path.join(app_dir, "eval_valid.py"),
+            "--dataset-root",
+            strict_split_dir,
+            "--split",
+            "test",
+            "--model-path",
+            os.path.abspath(args.model_path),
+            "--batch-size",
+            str(max(16, args.batch_size)),
+            "--progress-every",
+            "100",
+        ]
+        run_step(eval_cmd, cwd=app_dir)
+
+    print("\nStrict pipeline completed successfully.")
+    print("Strict split root:", strict_split_dir)
+    print("Model path:", os.path.abspath(args.model_path))
+
+
+if __name__ == "__main__":
+    main()
+
+
+File: app/train.py
+------------------
+import argparse
+import json
+import os
+import numpy as np
+import tensorflow as tf
+from sklearn.utils.class_weight import compute_class_weight
+
+# ======================
+# Imports
+# ======================
+
+ImageDataGenerator = tf.keras.preprocessing.image.ImageDataGenerator
+EfficientNetB3 = tf.keras.applications.EfficientNetB3
+preprocess_input = tf.keras.applications.efficientnet.preprocess_input
+layers = tf.keras.layers
+Adam = tf.keras.optimizers.Adam
+ModelCheckpoint = tf.keras.callbacks.ModelCheckpoint
+ReduceLROnPlateau = tf.keras.callbacks.ReduceLROnPlateau
+EarlyStopping = tf.keras.callbacks.EarlyStopping
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(APP_DIR)
+DEFAULT_DATASET_DIR = os.path.join(PROJECT_ROOT, "dataset")
+DEFAULT_MODEL_PATH = os.path.join(APP_DIR, "models", "best_model.keras")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train EfficientNet fake-image detector with reproducible settings."
+    )
+    parser.add_argument(
+        "--dataset-root",
+        default=DEFAULT_DATASET_DIR,
+        help="Dataset root containing train/valid/(optional test) folders.",
+    )
+    parser.add_argument(
+        "--model-path",
+        default=DEFAULT_MODEL_PATH,
+        help="Where to save best model checkpoint.",
+    )
+    parser.add_argument("--img-size", type=int, default=300)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--epochs-phase1", type=int, default=10)
+    parser.add_argument("--epochs-phase2", type=int, default=6)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--run-metadata-path",
+        default=os.path.join(APP_DIR, "models", "last_train_run.json"),
+        help="Path to save run metadata JSON.",
+    )
+    return parser.parse_args()
+
+
+args = parse_args()
+
+IMG_SIZE = int(args.img_size)
+BATCH_SIZE = int(args.batch_size)
+EPOCHS_PHASE1 = int(args.epochs_phase1)
+EPOCHS_PHASE2 = int(args.epochs_phase2)
+
+DATASET_DIR = os.path.abspath(args.dataset_root)
+TRAIN_DIR = os.path.join(DATASET_DIR, "train")
+VALID_DIR = os.path.join(DATASET_DIR, "valid")
+TEST_DIR = os.path.join(DATASET_DIR, "test")
+
+TRAIN_FAKE_DIR = os.path.join(TRAIN_DIR, "fake")
+TRAIN_REAL_DIR = os.path.join(TRAIN_DIR, "real")
+VALID_FAKE_DIR = os.path.join(VALID_DIR, "fake")
+VALID_REAL_DIR = os.path.join(VALID_DIR, "real")
+
+MODEL_PATH = os.path.abspath(args.model_path)
+BAD_FILES_REPORT = os.path.join(APP_DIR, "bad_images_train_report.txt")
+RUN_METADATA_PATH = os.path.abspath(args.run_metadata_path)
+
+# Verify dataset exists
+if not (os.path.isdir(TRAIN_DIR) and os.path.isdir(VALID_DIR)):
+    raise FileNotFoundError(
+        "Expected 'dataset/train' and 'dataset/valid' folders at the project root "
+        "(each with 'real' and 'fake' subfolders)."
+    )
+
+if not (os.path.isdir(TRAIN_FAKE_DIR) and os.path.isdir(TRAIN_REAL_DIR)):
+    raise FileNotFoundError(
+        "Expected strict binary folders in train split: 'dataset/train/fake' and "
+        "'dataset/train/real'."
+    )
+
+if not (os.path.isdir(VALID_FAKE_DIR) and os.path.isdir(VALID_REAL_DIR)):
+    raise FileNotFoundError(
+        "Expected strict binary folders in valid split: 'dataset/valid/fake' and "
+        "'dataset/valid/real'."
+    )
+
+
+def scan_unreadable_images(root_dir, class_names=("fake", "real")):
+    bad_files = []
+    checked = 0
+    for class_name in class_names:
+        class_dir = os.path.join(root_dir, class_name)
+        if not os.path.isdir(class_dir):
+            continue
+        for walk_root, _, files in os.walk(class_dir):
+            for file_name in files:
+                path = os.path.join(walk_root, file_name)
+                checked += 1
+                try:
+                    img = tf.keras.utils.load_img(path)
+                    _ = tf.keras.utils.img_to_array(img)
+                except Exception:
+                    bad_files.append(path)
+    return checked, bad_files
+
+
+print("\nRunning dataset integrity scan (train + valid)...")
+checked_train, bad_train = scan_unreadable_images(TRAIN_DIR)
+checked_valid, bad_valid = scan_unreadable_images(VALID_DIR)
+all_bad = bad_train + bad_valid
+
+print("Checked train files:", checked_train)
+print("Checked valid files:", checked_valid)
+if all_bad:
+    os.makedirs(os.path.dirname(BAD_FILES_REPORT), exist_ok=True)
+    with open(BAD_FILES_REPORT, "w", encoding="utf-8") as f:
+        f.write("Unreadable image files found before training:\n")
+        for path in all_bad:
+            f.write(path + "\n")
+    raise RuntimeError(
+        f"Found {len(all_bad)} unreadable image files. "
+        f"See report: {BAD_FILES_REPORT}. Remove/fix them, then retrain."
+    )
+print("Dataset integrity scan passed: no unreadable files found.")
+
+SEED = int(args.seed)
+tf.random.set_seed(SEED)
+np.random.seed(SEED)
+
+print("\nTraining config:")
+print("Dataset root:", DATASET_DIR)
+print("Model path:", MODEL_PATH)
+print("Image size:", IMG_SIZE)
+print("Batch size:", BATCH_SIZE)
+print("Epochs phase1:", EPOCHS_PHASE1)
+print("Epochs phase2:", EPOCHS_PHASE2)
+print("Seed:", SEED)
+if os.path.isdir(TEST_DIR):
+    print("Test split detected at:", TEST_DIR)
+
+
+# ======================
+# Data Generators (CLEAN)
+# ======================
+
+train_datagen = ImageDataGenerator(
+    preprocessing_function=preprocess_input,
+    rotation_range=10,
+    width_shift_range=0.05,
+    height_shift_range=0.05,
+    zoom_range=0.1,
+    horizontal_flip=True
+)
+
+val_datagen = ImageDataGenerator(
+    preprocessing_function=preprocess_input
+)
+
+train_data = train_datagen.flow_from_directory(
+    TRAIN_DIR,
+    target_size=(IMG_SIZE, IMG_SIZE),
+    batch_size=BATCH_SIZE,
+    class_mode='binary',
+    classes=['fake', 'real'],
+    shuffle=True,
+    seed=SEED
+)
+
+val_data = val_datagen.flow_from_directory(
+    VALID_DIR,
+    target_size=(IMG_SIZE, IMG_SIZE),
+    batch_size=BATCH_SIZE,
+    class_mode='binary',
+    classes=['fake', 'real'],
+    shuffle=False
+)
+
+# ======================
+# Dataset Verification (CRITICAL)
+# ======================
+
+print("\n Dataset Verification:")
+print("Class indices:", train_data.class_indices)
+
+expected_class_indices = {'fake': 0, 'real': 1}
+if train_data.class_indices != expected_class_indices:
+    raise RuntimeError(
+        f"Unexpected class mapping in train split: {train_data.class_indices}. "
+        f"Expected: {expected_class_indices}"
+    )
+if val_data.class_indices != expected_class_indices:
+    raise RuntimeError(
+        f"Unexpected class mapping in valid split: {val_data.class_indices}. "
+        f"Expected: {expected_class_indices}"
+    )
+
+class_counts = np.bincount(train_data.classes)
+print("Train fake:", class_counts[0] if len(class_counts) > 0 else 0)
+print("Train real:", class_counts[1] if len(class_counts) > 1 else 0)
+val_class_counts = np.bincount(val_data.classes)
+print("Valid fake:", val_class_counts[0] if len(val_class_counts) > 0 else 0)
+print("Valid real:", val_class_counts[1] if len(val_class_counts) > 1 else 0)
+
+# ======================
+# Class Weights (BALANCED)
+# ======================
+
+class_weights_values = compute_class_weight(
+    class_weight='balanced',
+    classes=np.unique(train_data.classes),
+    y=train_data.classes
+)
+
+class_weights = dict(enumerate(class_weights_values))
+print("\nClass weights:", class_weights)
+
+# ======================
+# Model Architecture
+# ======================
+
+base_model = EfficientNetB3(
+    input_shape=(IMG_SIZE, IMG_SIZE, 3),
+    include_top=False,
+    weights='imagenet'
+)
+
+base_model.trainable = False
+
+# Custom head
+x = base_model.output
+x = layers.GlobalAveragePooling2D()(x)
+x = layers.BatchNormalization()(x)
+
+x = layers.Dense(256, activation='relu')(x)
+x = layers.Dropout(0.5)(x)
+
+x = layers.Dense(128, activation='relu')(x)
+x = layers.Dropout(0.3)(x)
+
+output = layers.Dense(1, activation='sigmoid')(x)
+
+model = tf.keras.Model(inputs=base_model.input, outputs=output)
+
+# ======================
+# Compile (Phase 1)
+# ======================
+
+model.compile(
+    optimizer=Adam(learning_rate=1e-3),
+    loss='binary_crossentropy',
+    metrics=['accuracy']
+)
+
+model.summary()
+
+# ======================
+# Callbacks
+# ======================
+
+os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+
+checkpoint = ModelCheckpoint(
+    MODEL_PATH,
+    monitor='val_accuracy',
+    save_best_only=True,
+    mode='max',
+    verbose=1
+)
+
+reduce_lr = ReduceLROnPlateau(
+    monitor='val_loss',
+    factor=0.3,
+    patience=2,
+    min_lr=1e-6,
+    verbose=1
+)
+
+early_stop = EarlyStopping(
+    monitor='val_loss',
+    patience=5,
+    restore_best_weights=True,
+    verbose=1
+)
+
+callbacks = [checkpoint, reduce_lr, early_stop]
+
+# ======================
+# Phase 1 Training
+# ======================
+
+print("\n🔹 Phase 1: Training top layers...")
+model.fit(
+    train_data,
+    validation_data=val_data,
+    epochs=EPOCHS_PHASE1,
+    callbacks=callbacks,
+    class_weight=class_weights
+)
+
+# ======================
+# Phase 2 Fine-Tuning
+# ======================
+
+print("\n🔹 Phase 2: Fine-tuning...")
+
+base_model.trainable = True
+
+for layer in base_model.layers[:-50]:  # freeze most layers
+    layer.trainable = False
+
+model.compile(
+    optimizer=Adam(learning_rate=1e-5),
+    loss='binary_crossentropy',
+    metrics=['accuracy']
+)
+
+model.fit(
+    train_data,
+    validation_data=val_data,
+    epochs=EPOCHS_PHASE2,
+    callbacks=callbacks,
+    class_weight=class_weights
+)
+
+# ======================
+# Done
+# ======================
+
+print("\nTraining Complete!")
+print("Model saved at:", MODEL_PATH)
+
+os.makedirs(os.path.dirname(RUN_METADATA_PATH), exist_ok=True)
+run_metadata = {
+    "dataset_name": os.path.basename(os.path.normpath(DATASET_DIR)),
+    "dataset_root": DATASET_DIR,
+    "train_dir": TRAIN_DIR,
+    "valid_dir": VALID_DIR,
+    "test_dir_exists": bool(os.path.isdir(TEST_DIR)),
+    "model_path": MODEL_PATH,
+    "model": "EfficientNetB3",
+    "img_size": IMG_SIZE,
+    "batch_size": BATCH_SIZE,
+    "epochs_phase1": EPOCHS_PHASE1,
+    "epochs_phase2": EPOCHS_PHASE2,
+    "seed": SEED,
+    "class_indices": train_data.class_indices,
+    "train_counts": {
+        "fake": int(class_counts[0]) if len(class_counts) > 0 else 0,
+        "real": int(class_counts[1]) if len(class_counts) > 1 else 0,
+    },
+    "valid_counts": {
+        "fake": int(val_class_counts[0]) if len(val_class_counts) > 0 else 0,
+        "real": int(val_class_counts[1]) if len(val_class_counts) > 1 else 0,
+    },
+}
+with open(RUN_METADATA_PATH, "w", encoding="utf-8") as f:
+    json.dump(run_metadata, f, indent=2)
+print("Run metadata saved at:", RUN_METADATA_PATH)
+
+
+File: app/tune_threshold.py
+---------------------------
+import argparse
+import os
+import numpy as np
+import tensorflow as tf
+from sklearn.metrics import f1_score, recall_score
+
+ImageDataGenerator = tf.keras.preprocessing.image.ImageDataGenerator
+preprocess_input = tf.keras.applications.efficientnet.preprocess_input
+
+# Paths relative to this app folder
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(APP_DIR)
+DEFAULT_MODEL_PATH = os.path.join(APP_DIR, "models", "best_model.keras")
+DEFAULT_DATASET_ROOT = os.path.join(PROJECT_ROOT, "dataset")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Tune classification threshold on validation split.")
+    parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
+    parser.add_argument("--dataset-root", default=DEFAULT_DATASET_ROOT)
+    parser.add_argument("--batch-size", type=int, default=32)
+    return parser.parse_args()
+
+
+args = parse_args()
+MODEL_PATH = os.path.abspath(args.model_path)
+VAL_PATH = os.path.join(os.path.abspath(args.dataset_root), "valid")
+
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(f"Model not found at {MODEL_PATH}. Train first.")
+if not os.path.isdir(VAL_PATH):
+    raise FileNotFoundError(f"Validation folder not found at {VAL_PATH}.")
+
+# Load model
+print("Loading model from:", MODEL_PATH)
+model = tf.keras.models.load_model(MODEL_PATH)
+
+# Derive image size from model to stay in sync with training
+if hasattr(model, "input_shape") and len(model.input_shape) == 4:
+    IMG_SIZE = model.input_shape[1]
+else:
+    IMG_SIZE = 300
+
+BATCH_SIZE = int(args.batch_size)
+
+# Validation data
+print("Using IMG_SIZE =", IMG_SIZE)
+datagen = ImageDataGenerator(preprocessing_function=preprocess_input)
+
+val_data = datagen.flow_from_directory(
+    VAL_PATH,
+    target_size=(IMG_SIZE, IMG_SIZE),
+    batch_size=BATCH_SIZE,
+    class_mode='binary',
+    classes=['fake', 'real'],
+    shuffle=False,
+)
+
+expected_class_indices = {'fake': 0, 'real': 1}
+if val_data.class_indices != expected_class_indices:
+    raise RuntimeError(
+        f"Unexpected class mapping: {val_data.class_indices}. Expected: {expected_class_indices}"
+    )
+
+# Get predictions
+probs = model.predict(val_data).ravel()
+y_true = val_data.classes
+
+
+def _macro_f1(y_true_arr, y_pred_arr):
+    f1_fake = float(f1_score(y_true_arr, y_pred_arr, pos_label=0, zero_division=0))
+    f1_real = float(f1_score(y_true_arr, y_pred_arr, pos_label=1, zero_division=0))
+    return (f1_real + f1_fake) / 2.0, f1_real, f1_fake
+
+
+# Try thresholds from 0.1 to 0.9
+thresholds = np.arange(0.1, 0.9, 0.01)
+
+best_threshold = 0.5
+best_macro_f1 = 0.0
+best_real_f1 = 0.0
+best_fake_f1 = 0.0
+best_real_recall = 0.0
+
+for t in thresholds:
+    y_pred = (probs > t).astype(int)
+    macro_f1, real_f1, fake_f1 = _macro_f1(y_true, y_pred)
+    real_recall = float(recall_score(y_true, y_pred, pos_label=1, zero_division=0))
+    if macro_f1 > best_macro_f1:
+        best_macro_f1 = macro_f1
+        best_threshold = float(t)
+        best_real_f1 = real_f1
+        best_fake_f1 = fake_f1
+        best_real_recall = real_recall
+
+print("Best Threshold (macro F1):", round(best_threshold, 3))
+print("Macro F1:", round(best_macro_f1, 4))
+print("Real F1:", round(best_real_f1, 4), "| Fake F1:", round(best_fake_f1, 4))
+print("Real Recall:", round(best_real_recall, 4))
+
+
+File: app/optional_tools/mine_hard_examples.py
+-----------------------------------------------
+import argparse
+import csv
+import os
+import shutil
+import time
+from typing import List, Tuple
+import numpy as np
+import tensorflow as tf
+from sklearn.metrics import f1_score, recall_score
+
+ImageDataGenerator = tf.keras.preprocessing.image.ImageDataGenerator
+preprocess_input = tf.keras.applications.efficientnet.preprocess_input
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(APP_DIR)
+MODEL_PATH = os.path.join(APP_DIR, "models", "best_model.keras")
+DATASET_ROOT = os.path.join(PROJECT_ROOT, "dataset")
+DEFAULT_SOURCE = os.path.join(DATASET_ROOT, "valid")
+HARD_REAL_DIR = os.path.join(DATASET_ROOT, "hard_examples", "real")
+REPORT_PATH = os.path.join(APP_DIR, "hard_examples_report.csv")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Mine false-positive real images for re-training.")
+    parser.add_argument("--source", default=DEFAULT_SOURCE, help="Directory containing real/fake subfolders to scan.")
+    parser.add_argument("--threshold", type=float, default=None, help="Decision threshold. If omitted, macro F1 sweep determines it.")
+    parser.add_argument("--top-k", type=int, default=400, help="Maximum number of real hard examples to keep.")
+    parser.add_argument("--min-prob", type=float, default=0.55, help="Minimum fake probability required to keep a real sample.")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size for inference.")
+    return parser.parse_args()
+
+
+def _macro_f1(y_true, y_pred):
+    f1_fake = float(f1_score(y_true, y_pred, pos_label=0, zero_division=0))
+    f1_real = float(f1_score(y_true, y_pred, pos_label=1, zero_division=0))
+    real_recall = float(recall_score(y_true, y_pred, pos_label=1, zero_division=0))
+    return (f1_real + f1_fake) / 2.0, f1_real, f1_fake, real_recall
+
+
+def _sweep_threshold(y_true, probs):
+    best = {
+        "threshold": 0.5,
+        "macro_f1": 0.0,
+        "real_f1": 0.0,
+        "fake_f1": 0.0,
+        "real_recall": 0.0,
+    }
+    for t in np.arange(0.1, 0.9, 0.01):
+        y_pred = (probs > t).astype(int)
+        macro_f1, real_f1, fake_f1, real_recall = _macro_f1(y_true, y_pred)
+        if macro_f1 > best["macro_f1"]:
+            best.update({
+                "threshold": float(t),
+                "macro_f1": macro_f1,
+                "real_f1": real_f1,
+                "fake_f1": fake_f1,
+                "real_recall": real_recall,
+            })
+    return best
+
+
+def _ensure_model():
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(f"Model not found at {MODEL_PATH}. Train first.")
+
+
+def _copy_hard_examples(records: List[Tuple[str, float]]):
+    os.makedirs(HARD_REAL_DIR, exist_ok=True)
+    copied = []
+    timestamp = int(time.time())
+    for idx, (src, prob) in enumerate(records):
+        ext = os.path.splitext(src)[1].lower() or ".jpg"
+        dst_name = f"mined_real_{timestamp}_{idx:05d}_p{prob:.3f}{ext}"
+        dst_path = os.path.join(HARD_REAL_DIR, dst_name)
+        shutil.copy2(src, dst_path)
+        copied.append((src, dst_path, prob))
+    return copied
+
+
+def _write_report(rows):
+    headers = ["source_path", "copied_path", "predicted_prob"]
+    with open(REPORT_PATH, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(headers)
+        writer.writerows(rows)
+
+
+def main():
+    args = parse_args()
+    _ensure_model()
+    if not os.path.isdir(args.source):
+        raise FileNotFoundError(f"Source directory not found: {args.source}")
+
+    print("Loading model from:", MODEL_PATH)
+    model = tf.keras.models.load_model(MODEL_PATH)
+    img_size = model.input_shape[1] if hasattr(model, "input_shape") else 300
+
+    datagen = ImageDataGenerator(preprocessing_function=preprocess_input)
+    data = datagen.flow_from_directory(
+        args.source,
+        target_size=(img_size, img_size),
+        batch_size=args.batch_size,
+        class_mode='binary',
+        shuffle=False,
+    )
+
+    print("Running inference over", len(data.filenames), "images...")
+    probs = model.predict(data).ravel()
+    y_true = data.classes
+
+    if args.threshold is None:
+        sweep = _sweep_threshold(y_true, probs)
+        threshold = sweep["threshold"]
+        print(
+            "Sweep best -> threshold:", round(sweep["threshold"], 3),
+            "macro F1:", round(sweep["macro_f1"], 4),
+            "real F1:", round(sweep["real_f1"], 4),
+            "fake F1:", round(sweep["fake_f1"], 4),
+            "real recall:", round(sweep["real_recall"], 4),
+        )
+    else:
+        threshold = args.threshold
+        print("Using provided threshold:", threshold)
+
+    filepaths = data.filepaths
+    hard_real = []
+    for path, label, prob in zip(filepaths, y_true, probs):
+        if label == 1 and prob <= threshold and (1.0 - prob) >= args.min_prob:
+            hard_real.append((path, float(prob)))
+
+    hard_real.sort(key=lambda item: item[1], reverse=True)
+    if args.top_k > 0:
+        hard_real = hard_real[:args.top_k]
+
+    if not hard_real:
+        print("No hard real samples met the criteria.")
+        return
+
+    copied = _copy_hard_examples(hard_real)
+    rows = [(src, dst, f"{prob:.4f}") for src, dst, prob in copied]
+    _write_report(rows)
+
+    print("Copied", len(copied), "hard real samples to", HARD_REAL_DIR)
+    print("Report written to:", REPORT_PATH)
+
+
+if __name__ == "__main__":
+    main()
+
+
+File: app/optional_tools/sanity_check.py
+-----------------------------------------
+import argparse
+import os
+import numpy as np
+import tensorflow as tf
+
+ImageDataGenerator = tf.keras.preprocessing.image.ImageDataGenerator
+preprocess_input = tf.keras.applications.efficientnet.preprocess_input
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(APP_DIR)
+MODEL_PATH = os.path.join(APP_DIR, "models", "best_model.keras")
+VALID_DIR = os.path.join(PROJECT_ROOT, "dataset", "valid")
+
+
+def _metrics(y_true, y_pred):
+    tn = int(((y_true == 0) & (y_pred == 0)).sum())
+    fp = int(((y_true == 0) & (y_pred == 1)).sum())
+    fn = int(((y_true == 1) & (y_pred == 0)).sum())
+    tp = int(((y_true == 1) & (y_pred == 1)).sum())
+
+    acc = float((y_pred == y_true).mean())
+
+    precision_fake = tn / (tn + fn) if (tn + fn) else 0.0
+    recall_fake = tn / (tn + fp) if (tn + fp) else 0.0
+    f1_fake = (
+        2 * precision_fake * recall_fake / (precision_fake + recall_fake)
+        if (precision_fake + recall_fake)
+        else 0.0
+    )
+
+    precision_real = tp / (tp + fp) if (tp + fp) else 0.0
+    recall_real = tp / (tp + fn) if (tp + fn) else 0.0
+    f1_real = (
+        2 * precision_real * recall_real / (precision_real + recall_real)
+        if (precision_real + recall_real)
+        else 0.0
+    )
+
+    macro_f1 = (f1_fake + f1_real) / 2.0
+
+    return {
+        "tn": tn,
+        "fp": fp,
+        "fn": fn,
+        "tp": tp,
+        "acc": acc,
+        "precision_fake": precision_fake,
+        "recall_fake": recall_fake,
+        "f1_fake": f1_fake,
+        "precision_real": precision_real,
+        "recall_real": recall_real,
+        "f1_real": f1_real,
+        "macro_f1": macro_f1,
+    }
+
+
+def _print_block(title, threshold, m):
+    print("\n" + title)
+    print("threshold:", round(float(threshold), 3))
+    print("accuracy:", round(m["acc"] * 100.0, 2), "%")
+    print("macro_f1:", round(m["macro_f1"], 4))
+    print("f1_fake:", round(m["f1_fake"], 4), "| f1_real:", round(m["f1_real"], 4))
+    print("\nConfusion Matrix (counts):")
+    print("            Pred Fake   Pred Real")
+    print(f"True Fake   {m['tn']:9d} {m['fp']:10d}")
+    print(f"True Real   {m['fn']:9d} {m['tp']:10d}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Sanity checks for class mapping, counts, and threshold tuning."
+    )
+    parser.add_argument(
+        "--objective",
+        choices=["macro-f1", "real-safe"],
+        default="macro-f1",
+        help="Optimization objective for tuned threshold.",
+    )
+    parser.add_argument(
+        "--min-real-precision",
+        type=float,
+        default=0.75,
+        help="Used for real-safe objective. Keeps thresholds with precision_real >= this value and chooses best recall_real.",
+    )
+    parser.add_argument("--batch-size", type=int, default=32)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(f"Model not found at {MODEL_PATH}.")
+    if not os.path.isdir(VALID_DIR):
+        raise FileNotFoundError(f"Validation directory not found at {VALID_DIR}.")
+
+    print("Loading model from:", MODEL_PATH)
+    model = tf.keras.models.load_model(MODEL_PATH)
+
+    if not hasattr(model, "input_shape") or len(model.input_shape) != 4:
+        raise RuntimeError("Unexpected model input shape; expected rank-4 image input.")
+
+    img_size = (int(model.input_shape[1]), int(model.input_shape[2]))
+    print("Using validation image size:", img_size)
+
+    val_data = ImageDataGenerator(preprocessing_function=preprocess_input).flow_from_directory(
+        VALID_DIR,
+        target_size=img_size,
+        batch_size=args.batch_size,
+        class_mode="binary",
+        classes=["fake", "real"],
+        shuffle=False,
+    )
+
+    expected = {"fake": 0, "real": 1}
+    if val_data.class_indices != expected:
+        raise RuntimeError(
+            f"Unexpected class mapping: {val_data.class_indices}. Expected: {expected}"
+        )
+
+    y_true = val_data.classes.astype(int)
+    counts = np.bincount(y_true)
+
+    print("\nClass indices:", val_data.class_indices)
+    print("Sample counts -> fake:", int(counts[0]) if len(counts) > 0 else 0, ", real:", int(counts[1]) if len(counts) > 1 else 0)
+
+    probs = model.predict(val_data, verbose=0).ravel()
+
+    baseline_pred = (probs > 0.5).astype(int)
+    baseline = _metrics(y_true, baseline_pred)
+    _print_block("Baseline @ 0.5", 0.5, baseline)
+
+    thresholds = np.arange(0.1, 0.901, 0.01)
+
+    best_t = 0.5
+    best_m = baseline
+
+    if args.objective == "macro-f1":
+        for t in thresholds:
+            y_pred = (probs > t).astype(int)
+            m = _metrics(y_true, y_pred)
+            if m["macro_f1"] > best_m["macro_f1"]:
+                best_t = float(t)
+                best_m = m
+    else:
+        found = False
+        for t in thresholds:
+            y_pred = (probs > t).astype(int)
+            m = _metrics(y_true, y_pred)
+            if m["precision_real"] >= args.min_real_precision:
+                if (not found) or (m["recall_real"] > best_m["recall_real"]):
+                    found = True
+                    best_t = float(t)
+                    best_m = m
+        if not found:
+            print(
+                "\nNo threshold satisfied precision_real >=",
+                args.min_real_precision,
+                "; falling back to macro-f1 objective.",
+            )
+            best_t = 0.5
+            best_m = baseline
+            for t in thresholds:
+                y_pred = (probs > t).astype(int)
+                m = _metrics(y_true, y_pred)
+                if m["macro_f1"] > best_m["macro_f1"]:
+                    best_t = float(t)
+                    best_m = m
+
+    _print_block("Tuned Threshold", best_t, best_m)
+
+    print("\nRecommended threshold for app.py:", round(best_t, 3))
+    print("Expected direction: REAL_IF_HIGH_PROB = True")
+
+
+if __name__ == "__main__":
+    main()
+
+
+File: app/optional_tools/simple_eval.py
+----------------------------------------
+#!/usr/bin/env python
+import os
+import sys
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+try:
+    import numpy as np
+    import tensorflow as tf
+
+    ImageDataGenerator = tf.keras.preprocessing.image.ImageDataGenerator
+    preprocess_input = tf.keras.applications.efficientnet.preprocess_input
+    
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+    PROJECT_ROOT = os.path.dirname(APP_DIR)
+    VALID_DIR = os.path.join(PROJECT_ROOT, 'dataset', 'valid')
+    MODEL_PATH = os.path.join(APP_DIR, 'models', 'best_model.keras')
+    THRESHOLD = 0.44
+    
+    # Load model
+    model = tf.keras.models.load_model(MODEL_PATH)
+
+    # Keep eval size aligned with model input size.
+    if hasattr(model, "input_shape") and len(model.input_shape) == 4:
+        target_size = (int(model.input_shape[1]), int(model.input_shape[2]))
+    else:
+        target_size = (300, 300)
+    
+    # Prepare validation data
+    val_datagen = ImageDataGenerator(preprocessing_function=preprocess_input)
+    val_data = val_datagen.flow_from_directory(
+        VALID_DIR,
+        target_size=target_size,
+        batch_size=32,
+        class_mode='binary',
+        shuffle=False,
+    )
+    
+    # Evaluate
+    loss, acc = model.evaluate(val_data, verbose=0)
+    
+    # Get predictions
+    probs = model.predict(val_data, verbose=0).ravel()
+    preds = (probs > THRESHOLD).astype(int)
+    true = val_data.classes
+    
+    # Confusion matrix
+    cm = np.zeros((2, 2), dtype=int)
+    for t, p in zip(true, preds):
+        cm[int(t), int(p)] += 1
+    
+    tn, fp, fn, tp = cm[0, 0], cm[0, 1], cm[1, 0], cm[1, 1]
+    
+    # Calculate metrics
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+    
+    # Output results
+    with open(os.path.join(APP_DIR, 'eval_results.txt'), 'w') as f:
+        f.write("="*60 + "\n")
+        f.write("MODEL EVALUATION RESULTS\n")
+        f.write("="*60 + "\n\n")
+        f.write(f"Validation Accuracy: {acc * 100:.2f}%\n")
+        f.write(f"Validation Loss: {loss:.4f}\n\n")
+        f.write("CONFUSION MATRIX:\n")
+        f.write(f"            Predicted Fake   Predicted Real\n")
+        f.write(f"Actual Fake {tn:17d} {fp:16d}\n")
+        f.write(f"Actual Real {fn:17d} {tp:16d}\n\n")
+        f.write("COUNTS:\n")
+        f.write(f"True Negatives:  {tn}\n")
+        f.write(f"False Positives: {fp}\n")
+        f.write(f"False Negatives: {fn}\n")
+        f.write(f"True Positives:  {tp}\n\n")
+        f.write("ADDITIONAL METRICS:\n")
+        f.write(f"Precision (Real): {precision * 100:.2f}%\n")
+        f.write(f"Recall (Real): {recall * 100:.2f}%\n")
+        f.write(f"F1-Score: {f1 * 100:.2f}%\n")
+        f.write(f"Total Samples: {len(true)}\n")
+    
+    print("✓ Evaluation complete! Results saved to eval_results.txt")
+    
+except Exception as e:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'eval_error.txt'), 'w') as f:
+        f.write(f"Error: {str(e)}\n")
+        import traceback
+        f.write(traceback.format_exc())
+    print(f"Error: {e}")
+    sys.exit(1)
+
+
+README
+======
+# deep-learning-fake-image-detection
+
+## Reproducible Strict Pipeline
+
+This project supports a reproducible stratified train/valid/test workflow.
+
+### 1) Build deterministic split
+
+```bash
+python app/build_stratified_splits.py \
+	--dataset-root dataset \
+	--source-mode existing-splits \
+	--output-dir dataset/strict_split \
+	--seed 42 \
+	--valid-ratio 0.15 \
+	--test-ratio 0.10 \
+	--link-mode hardlink \
+	--overwrite
+```
+
+This creates:
+
+- dataset/strict_split/train/fake, dataset/strict_split/train/real
+- dataset/strict_split/valid/fake, dataset/strict_split/valid/real
+- dataset/strict_split/test/fake, dataset/strict_split/test/real
+- dataset/strict_split/manifests/{train.csv,valid.csv,test.csv,metadata.json}
+
+### 2) Train on strict split
+
+```bash
+python app/train.py \
+	--dataset-root dataset/strict_split \
+	--model-path app/models/best_model.keras \
+	--seed 42 \
+	--img-size 300 \
+	--batch-size 16 \
+	--epochs-phase1 10 \
+	--epochs-phase2 6
+```
+
+Training writes run metadata to app/models/last_train_run.json.
+
+### 3) Tune threshold on validation only
+
+```bash
+python app/tune_threshold.py \
+	--dataset-root dataset/strict_split \
+	--model-path app/models/best_model.keras
+```
+
+### 4) Strict test evaluation
+
+```bash
+python app/eval_valid.py \
+	--dataset-root dataset/strict_split \
+	--split test \
+	--model-path app/models/best_model.keras \
+	--progress-every 100
+```
+
+### One-command pipeline
+
+```bash
+python app/run_strict_pipeline.py --overwrite-split
+```
+
+### Optional utilities (not required for core pipeline)
+
+The following scripts were moved to keep app/ focused on core pipeline modules:
+
+- app/optional_tools/sanity_check.py
+- app/optional_tools/mine_hard_examples.py
+- app/optional_tools/simple_eval.py
+
+Generated logs are stored under:
+
+- app/logs/
+
+Runtime web uploads are stored under:
+
+- app/static/uploads/
+
+
+Additional Notes
+================
+Setup Instructions
+------------------
+1. Use Python 3.10+ (recommended) in a virtual environment.
+2. Install dependencies:
+   pip install tensorflow keras flask werkzeug numpy scikit-learn
+3. Ensure dataset folders exist with binary class subfolders fake/ and real/.
+4. Place trained model at app/models/best_model.keras for app inference.
+
+Dependencies (from source imports)
+----------------------------------
+- tensorflow
+- keras
+- flask
+- werkzeug
+- numpy
+- scikit-learn
+- python standard library modules: argparse, csv, hashlib, json, os, random, shutil, datetime, subprocess, sys, time, typing
+
+Usage Examples
+--------------
+1. Build deterministic split:
+   python app/build_stratified_splits.py --dataset-root dataset --source-mode existing-splits --output-dir dataset/strict_split --seed 42 --valid-ratio 0.15 --test-ratio 0.10 --link-mode hardlink --overwrite
+
+2. Train model:
+   python app/train.py --dataset-root dataset/strict_split --model-path app/models/best_model.keras --seed 42 --img-size 300 --batch-size 16 --epochs-phase1 10 --epochs-phase2 6
+
+3. Tune threshold:
+   python app/tune_threshold.py --dataset-root dataset/strict_split --model-path app/models/best_model.keras
+
+4. Evaluate on strict test split:
+   python app/eval_valid.py --dataset-root dataset/strict_split --split test --model-path app/models/best_model.keras --progress-every 100
+
+5. Run one-command strict pipeline:
+   python app/run_strict_pipeline.py --overwrite-split
+
+6. Run Flask web app:
+   python app/app.py

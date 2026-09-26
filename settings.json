@@ -1,0 +1,17 @@
+{
+    "git.ignoreLimitWarning": true,
+    "python.defaultInterpreterPath": "d:\\fake image detection\\deep-learning-fake-image-detection\\venv\\Scripts\\python.exe",
+    "python.terminal.activateEnvironment": true,
+    "python.terminal.executeInFileDir": true,
+    "terminal.integrated.cwd": "${workspaceFolder}/deep-learning-fake-image-detection",
+
+    "code-runner.fileDirectoryAsCwd": true,
+    "code-runner.executorMap": {
+        "python": "\"d:\\fake image detection\\deep-learning-fake-image-detection\\venv\\Scripts\\python.exe\" -u \"$fullFileName\""
+    },
+    "python.linting.enabled": false,
+    "python.ignoreDeprecations": true,
+    "[python]": {
+        "editor.defaultFormatter": "ms-python.python"
+    }
+}

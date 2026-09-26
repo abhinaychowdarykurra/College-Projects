@@ -1,0 +1,26 @@
+{
+  "dataset_name": "strict_split",
+  "dataset_root": "D:\\fake image detection\\deep-learning-fake-image-detection\\dataset\\strict_split",
+  "train_dir": "D:\\fake image detection\\deep-learning-fake-image-detection\\dataset\\strict_split\\train",
+  "valid_dir": "D:\\fake image detection\\deep-learning-fake-image-detection\\dataset\\strict_split\\valid",
+  "test_dir_exists": true,
+  "model_path": "D:\\fake image detection\\deep-learning-fake-image-detection\\app\\models\\best_model.keras",
+  "model": "EfficientNetB3",
+  "img_size": 300,
+  "batch_size": 16,
+  "epochs_phase1": 10,
+  "epochs_phase2": 6,
+  "seed": 42,
+  "class_indices": {
+    "fake": 0,
+    "real": 1
+  },
+  "train_counts": {
+    "fake": 1796,
+    "real": 3147
+  },
+  "valid_counts": {
+    "fake": 1000,
+    "real": 1000
+  }
+}
